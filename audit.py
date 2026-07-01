@@ -58,3 +58,21 @@ def find_by_content_id(content_id):
         if entry.get("content_id") == content_id and entry.get("event_type") == "classification":
             return entry
     return None
+
+
+def update_status(content_id, status):
+    """Set the status on the classification entry for `content_id`.
+
+    Reflects the content's current status (e.g. "under_review" after an appeal)
+    on the original record. Returns True if a record was updated.
+    """
+    log = read_log()
+    updated = False
+    for entry in log:
+        if entry.get("content_id") == content_id and entry.get("event_type") == "classification":
+            entry["status"] = status
+            updated = True
+    if updated:
+        with open(LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2)
+    return updated

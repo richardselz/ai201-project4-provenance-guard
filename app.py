@@ -11,14 +11,27 @@ returned as a clearly-marked placeholder.
 import uuid
 
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 import audit
 from detection import combine_signals, groq_signal, interpret, stylometric_signal
+from labels import label_for
 
 app = Flask(__name__)
 
+# Rate limiting. Limits are per client IP. See README for the reasoning behind
+# these specific values (realistic creator usage vs. flood protection).
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit():
     body = request.get_json(silent=True) or {}
     text = body.get("text")
@@ -38,9 +51,7 @@ def submit():
     combined = combine_signals(groq["p_ai"], styl["p_ai"], styl)
     confidence = combined["p_ai"]
     attribution = interpret(confidence)
-
-    # Label still a placeholder until M5.
-    label = "(placeholder — transparency label added in M5)"
+    label = label_for(attribution)
 
     audit.append_entry(
         {
@@ -71,6 +82,56 @@ def submit():
                 "heuristic_metrics": styl["metrics"],
             },
             "adjustments": combined["adjustments"],
+        }
+    )
+
+
+@app.route("/appeal", methods=["POST"])
+@limiter.limit("20 per hour")
+def appeal():
+    """Let a creator contest a classification.
+
+    Captures their reasoning, flips the content's status to "under_review", and
+    logs the appeal alongside a snapshot of the original decision (which is
+    preserved). Does not re-classify — a human reviewer handles it later.
+    """
+    body = request.get_json(silent=True) or {}
+    content_id = body.get("content_id")
+    reasoning = body.get("creator_reasoning")
+
+    if not content_id or not reasoning:
+        return (
+            jsonify({"error": "Both 'content_id' and 'creator_reasoning' are required."}),
+            400,
+        )
+
+    original = audit.find_by_content_id(content_id)
+    if original is None:
+        return jsonify({"error": f"No classification found for content_id {content_id}."}), 404
+
+    audit.update_status(content_id, "under_review")
+
+    audit.append_entry(
+        {
+            "event_type": "appeal",
+            "content_id": content_id,
+            "creator_id": original.get("creator_id"),
+            "appeal_reasoning": reasoning,
+            "status": "under_review",
+            "original_decision": {
+                "attribution": original.get("attribution"),
+                "confidence": original.get("confidence"),
+                "groq_score": original.get("groq_score"),
+                "heuristic_score": original.get("heuristic_score"),
+            },
+        }
+    )
+
+    return jsonify(
+        {
+            "content_id": content_id,
+            "status": "under_review",
+            "message": "Your appeal has been received and the content is now under review.",
         }
     )
 
