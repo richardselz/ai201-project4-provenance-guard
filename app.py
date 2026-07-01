@@ -13,26 +13,9 @@ import uuid
 from flask import Flask, jsonify, request
 
 import audit
-from detection import groq_signal
+from detection import combine_signals, groq_signal, interpret, stylometric_signal
 
 app = Flask(__name__)
-
-
-def _interim_attribution(p_ai):
-    """Map a probability to an attribution label using the M2 threshold table.
-
-    Interim only: in M3 this runs on the Groq score alone. In M4 it will run on
-    the combined P(AI) from both signals.
-    """
-    if p_ai < 0.20:
-        return "human"
-    if p_ai < 0.30:
-        return "likely-human"
-    if p_ai < 0.73:
-        return "uncertain"
-    if p_ai < 0.85:
-        return "likely-AI"
-    return "AI"
 
 
 @app.route("/submit", methods=["POST"])
@@ -47,15 +30,16 @@ def submit():
     content_id = str(uuid.uuid4())
 
     try:
-        signal = groq_signal(text)
+        groq = groq_signal(text)
     except Exception as exc:  # network/parse failure -> surface cleanly
         return jsonify({"error": f"Detection failed: {exc}"}), 502
 
-    p_ai = signal["p_ai"]
-    attribution = _interim_attribution(p_ai)
+    styl = stylometric_signal(text)
+    combined = combine_signals(groq["p_ai"], styl["p_ai"], styl)
+    confidence = combined["p_ai"]
+    attribution = interpret(confidence)
 
-    # Placeholders until M4 (confidence) and M5 (label).
-    confidence = None
+    # Label still a placeholder until M5.
     label = "(placeholder — transparency label added in M5)"
 
     audit.append_entry(
@@ -65,8 +49,11 @@ def submit():
             "creator_id": creator_id,
             "attribution": attribution,
             "confidence": confidence,
-            "groq_score": p_ai,
-            "groq_reasoning": signal["reasoning"],
+            "groq_score": groq["p_ai"],
+            "groq_reasoning": groq["reasoning"],
+            "heuristic_score": styl["p_ai"],
+            "heuristic_metrics": styl["metrics"],
+            "adjustments": combined["adjustments"],
             "status": "classified",
         }
     )
@@ -77,7 +64,13 @@ def submit():
             "attribution": attribution,
             "confidence": confidence,
             "label": label,
-            "signals": {"groq_score": p_ai, "groq_reasoning": signal["reasoning"]},
+            "signals": {
+                "groq_score": groq["p_ai"],
+                "groq_reasoning": groq["reasoning"],
+                "heuristic_score": styl["p_ai"],
+                "heuristic_metrics": styl["metrics"],
+            },
+            "adjustments": combined["adjustments"],
         }
     )
 

@@ -1,15 +1,23 @@
 """Detection signals for Provenance Guard.
 
-Signal 1 (this file, M3): Groq LLM classification. Asks a model to judge how
-AI-generated a piece of text reads and return a probability. This captures
-semantic/stylistic coherence holistically.
+Signal 1: Groq LLM classification. Asks a model to judge how AI-generated a
+piece of text reads and return a probability. Captures semantic/stylistic
+coherence holistically.
 
-Signal 2 (stylometric heuristics) and the combine/interpret logic are added
-in M4.
+Signal 2: stylometric heuristics (pure Python). Measures structural properties
+that tend to differ between human and AI writing — sentence-length variance
+(burstiness), type-token ratio (vocabulary diversity), and punctuation density.
+AI text tends to be more uniform; human writing is more variable.
+
+The two signals are combined into a single P(AI) via `combine_signals`, and
+`interpret` maps that probability to one of five attribution states using the
+threshold table from planning.md.
 """
 
 import json
 import os
+import re
+import statistics
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -17,6 +25,14 @@ from groq import Groq
 load_dotenv()
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Combine weights (planning.md, "Combining Signals").
+# NOTE (M4 revision): the original hypothesis weighted the heuristic heavier
+# (0.25/0.75). M4 testing showed the heuristic is near-flat on short text
+# (TTR saturates, too few sentences for burstiness), collapsing everything to
+# "uncertain". Groq separates cleanly, so we flipped the weights to trust it.
+GROQ_WEIGHT = 0.75
+HEURISTIC_WEIGHT = 0.25
 
 # System prompt asks for a strict JSON object so we can parse a numeric score.
 _SYSTEM_PROMPT = (
@@ -64,21 +80,160 @@ def groq_signal(text):
     return {"p_ai": p_ai, "reasoning": reasoning}
 
 
+# --- Signal 2: stylometric heuristics -------------------------------------
+
+def _lerp_score(value, ai_end, human_end):
+    """Map a raw metric to a 0-1 AI-likelihood by linear interpolation.
+
+    `ai_end` is the metric value that reads as fully AI (-> 1.0); `human_end`
+    reads as fully human (-> 0.0). Handles either direction (ai_end may be
+    greater or less than human_end). Values outside the range clamp to [0, 1].
+    """
+    if ai_end == human_end:
+        return 0.5
+    score = (value - human_end) / (ai_end - human_end)
+    return max(0.0, min(1.0, score))
+
+
+def stylometric_signal(text):
+    """Return the stylometric heuristic signal for `text`.
+
+    Returns {"p_ai": float in [0, 1], "metrics": {...}, "small_sample": bool}.
+
+    Three sub-metrics, each mapped to an AI-likelihood and blended (burstiness
+    weighted highest as the most defensible tell):
+      - burstiness: stdev of sentence lengths. Low = uniform = AI-like.
+      - type-token ratio: unique/total words. Low = repetitive = AI-like.
+      - punctuation density: punctuation per word. Very low = AI-like; the
+        expressive punctuation of casual human writing reads as human.
+    """
+    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
+    words = re.findall(r"\b\w+\b", text.lower())
+    n_words = len(words)
+
+    # Small-sample guard: too little text for these stats to mean anything.
+    # (planning.md edge case) — return neutral and let the caller skew.
+    small_sample = len(sentences) < 2 or n_words < 20
+
+    sentence_lengths = [len(re.findall(r"\b\w+\b", s)) for s in sentences]
+    burstiness = statistics.pstdev(sentence_lengths) if len(sentence_lengths) >= 2 else 0.0
+    ttr = (len(set(words)) / n_words) if n_words else 0.0
+    punct_count = len(re.findall(r"[.,;:!?\-—\"'()]", text))
+    punct_density = (punct_count / n_words) if n_words else 0.0
+
+    # Map each metric to AI-likelihood (1.0 = AI-like).
+    burst_score = _lerp_score(burstiness, ai_end=3.0, human_end=12.0)
+    ttr_score = _lerp_score(ttr, ai_end=0.40, human_end=0.75)
+    punct_score = _lerp_score(punct_density, ai_end=0.05, human_end=0.20)
+
+    if small_sample:
+        p_ai = 0.5  # not enough signal; stay neutral
+    else:
+        p_ai = 0.50 * burst_score + 0.25 * ttr_score + 0.25 * punct_score
+    p_ai = round(max(0.0, min(1.0, p_ai)), 3)
+
+    return {
+        "p_ai": p_ai,
+        "small_sample": small_sample,
+        "metrics": {
+            "burstiness": round(burstiness, 3),
+            "type_token_ratio": round(ttr, 3),
+            "punctuation_density": round(punct_density, 3),
+            "sentence_count": len(sentences),
+            "word_count": n_words,
+        },
+    }
+
+
+# --- Combine + interpret ---------------------------------------------------
+
+def protective_adjustments(styl_result):
+    """Return content-aware skews that protect creators in known blind-spot cases.
+
+    Each adjustment is (reason, delta) where delta is negative (toward human).
+    These target the planning.md edge cases where our signals are unreliable:
+      - small sample: too little text for either signal to be trusted.
+      - simple/repetitive vocabulary (e.g. a structured poem): low type-token
+        ratio + low burstiness make the heuristic read it as uniform "AI".
+    """
+    adjustments = []
+    if styl_result.get("small_sample"):
+        adjustments.append(("small_sample", -0.10))
+
+    m = styl_result.get("metrics", {})
+    ttr = m.get("type_token_ratio", 1.0)
+    burstiness = m.get("burstiness", 99.0)
+    if not styl_result.get("small_sample") and ttr < 0.55 and burstiness < 4.0:
+        adjustments.append(("simple_repetitive_vocabulary", -0.10))
+
+    return adjustments
+
+
+def combine_signals(groq_p, heuristic_p, styl_result=None):
+    """Blend the two signals into a single P(AI) using the planning.md weights,
+    then apply content-aware protective skews.
+
+    Returns {"p_ai": float in [0, 1], "base": float, "adjustments": [(reason, delta)]}.
+    """
+    base = GROQ_WEIGHT * groq_p + HEURISTIC_WEIGHT * heuristic_p
+    adjustments = protective_adjustments(styl_result) if styl_result else []
+    p_ai = base + sum(delta for _, delta in adjustments)
+    p_ai = round(max(0.0, min(1.0, p_ai)), 3)
+    return {"p_ai": p_ai, "base": round(base, 4), "adjustments": adjustments}
+
+
+def interpret(p_ai):
+    """Map a P(AI) to an attribution state (planning.md threshold table)."""
+    if p_ai < 0.20:
+        return "human"
+    if p_ai < 0.30:
+        return "likely-human"
+    if p_ai < 0.73:
+        return "uncertain"
+    if p_ai < 0.85:
+        return "likely-AI"
+    return "AI"
+
+
 if __name__ == "__main__":
-    # Quick standalone test: `python detection.py`
+    # M4 scoring test: 4 deliberately chosen inputs across the range.
     samples = {
         "clearly AI": (
             "Artificial intelligence represents a transformative paradigm shift "
             "in modern society. It is important to note that while the benefits "
             "of AI are numerous, it is equally essential to consider the ethical "
-            "implications."
+            "implications. Furthermore, stakeholders across various sectors must "
+            "collaborate to ensure responsible deployment."
         ),
         "clearly human": (
             "ok so i finally tried that new ramen place downtown and honestly? "
-            "underwhelming. the broth was fine but way too much sodium and i was "
-            "thirsty for like three hours after."
+            "underwhelming. the broth was fine but they put WAY too much sodium "
+            "in it and i was thirsty for like three hours after. my friend got "
+            "the spicy version and said it was better. probably won't go back "
+            "unless someone drags me there"
+        ),
+        "borderline: formal human": (
+            "The relationship between monetary policy and asset price inflation "
+            "has been extensively studied in the literature. Central banks face "
+            "a fundamental tension between their mandate for price stability and "
+            "the unintended consequences of prolonged low interest rates on "
+            "equity and real estate valuations."
+        ),
+        "borderline: lightly edited AI": (
+            "I've been thinking a lot about remote work lately. There are genuine "
+            "tradeoffs — flexibility and no commute on one side, isolation and "
+            "blurred work-life boundaries on the other. Studies show productivity "
+            "varies widely by individual and role type."
         ),
     }
+    print(f"{'input':<28} {'groq':>5} {'heur':>5} {'P(AI)':>6}  attribution   adjustments")
+    print("-" * 90)
     for label, sample in samples.items():
-        result = groq_signal(sample)
-        print(f"[{label}] p_ai={result['p_ai']:.2f} :: {result['reasoning']}")
+        g = groq_signal(sample)
+        h = stylometric_signal(sample)
+        c = combine_signals(g["p_ai"], h["p_ai"], h)
+        adj = ", ".join(f"{r}({d:+.2f})" for r, d in c["adjustments"]) or "-"
+        print(
+            f"{label:<28} {g['p_ai']:>5.2f} {h['p_ai']:>5.2f} "
+            f"{c['p_ai']:>6.2f}  {interpret(c['p_ai']):<13} {adj}"
+        )
